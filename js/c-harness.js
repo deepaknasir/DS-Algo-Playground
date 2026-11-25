@@ -635,14 +635,26 @@ int main(void) {
     return results;
   }
 
-  /** Strip ANSI colors and noise from GCC diagnostics; keep user-file errors readable. */
+  /** Strip ANSI colors and noise from GCC / Clang diagnostics; keep user-file errors readable. */
   function formatCompileErrors(stderr) {
     var s = String(stderr || '').replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
+    // Clang + wasm-ld (the in-browser compiler)
+    s = s.replace(/^wasm-ld: error: \S+\.o: undefined symbol: (.*)$/gm,
+      'linker: undefined symbol: $1 (is a function missing, or named differently?)');
+    s = s.replace(/^wasm-ld: /gm, 'linker: ');
+    s = s.replace(/^clang: error: linker command failed.*$/gm, '');
     s = s.replace(/^.*?(\/app\/|<source>:)/gm, function (m) { return m.indexOf('/app/') >= 0 ? '' : '<source>:'; });
     s = s.replace(/^Compiler returned: \d+\s*$/gm, '');
     s = s.replace(/^collect2: error: ld returned 1 exit status\s*$/gm, '');
     s = s.replace(/^\/usr\/bin\/ld: [^\n]*?(\S+\.o|\/tmp\/\S+): in function `main':\s*$/gm, '');
     s = s.replace(/^.*?\/ld: /gm, 'linker: ');
+    // wasm-ld reports an undefined symbol once per call site; once is enough
+    var seen = {};
+    s = s.split('\n').filter(function (l) {
+      if (!/^linker: /.test(l)) return true;
+      if (seen[l]) return false;
+      return (seen[l] = true);
+    }).join('\n');
     return s.replace(/\n{3,}/g, '\n\n').trim();
   }
 

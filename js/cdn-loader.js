@@ -3,12 +3,14 @@
      - loadCodeMirror / makeEditor — CodeMirror, self-hosted in /vendor/codemirror/
      - runPython / warmup          — Python via a Web Worker (js/pyodide-worker.js),
                                       so a runaway program can be terminated
-     - runC / loadCHarness         — C compiled + run by GCC on godbolt.org's public
-                                      API (static hosting can't run a C compiler);
+     - runC / warmupC / loadCHarness — C compiled by Clang-in-WebAssembly in a
+                                      compile worker (js/c-compile-worker.js) and run
+                                      in a disposable worker (js/c-run-worker.js);
                                       js/c-harness.js wraps solutions in a test main()
      - lang                        — site-wide Python/C preference (localStorage)
      - normalizeIndent / formatPyError — editor + traceback helpers
-   Pyodide itself still loads from cdn.jsdelivr.net (inside the worker) due to size. */
+   Pyodide and the Clang toolchain load from cdn.jsdelivr.net (inside the workers)
+   due to size; code never leaves the browser. */
 var DSA = window.DSA || {};
 
 (function() {
@@ -310,75 +312,180 @@ var DSA = window.DSA || {};
     }
   };
 
-  // --- C via Compiler Explorer (godbolt.org) -----------------------------
-  // GitHub Pages can't host a compiler, and in-browser C interpreters only
-  // cover a subset of the language, so C is compiled with real GCC and run by
-  // Compiler Explorer's public API (CORS-enabled). The code is sent to
-  // godbolt.org; nothing else is.
-  var GODBOLT_URL = 'https://godbolt.org/api/compiler/cg132/compile'; // x86-64 gcc 13.2
-  var C_FLAGS = '-O2 -std=gnu11 -fdiagnostics-color=never -lm';
+  // --- C, compiled and run in the browser (WebAssembly) ------------------
+  // Clang built for WebAssembly compiles the program to wasm32-wasi in a
+  // long-lived compile worker (js/c-compile-worker.js; the toolchain comes
+  // from jsDelivr once, then the browser cache). The program then runs in a
+  // disposable run worker (js/c-run-worker.js) through the WASI shim in
+  // js/c-wasi.js. Nothing is sent to a server, and it works offline once
+  // cached. Two workers, so killing a runaway program (wasm can't be
+  // interrupted from inside) doesn't also throw away the loaded compiler.
+  var C_COMPILE_TIMEOUT_MS = 180000; // includes the first-time toolchain download
+  var C_TEST_TIMEOUT_MS = 2000;      // per harness test, like the native alarm(2)
+  var C_RUN_TIMEOUT_MS = 10000;      // a plain program (code blocks)
 
-  function stripAnsi(s) { return String(s || '').replace(/\x1b\[[0-9;]*[A-Za-z]/g, ''); }
-  function joinLines(arr) { return (arr || []).map(function(l) { return l.text; }).join('\n'); }
+  var cc = null;          // compile worker
+  var ccId = 0;
+  var ccPending = {};     // id -> { cb, timer, onStatus }
+  var cWarmed = false;
+
+  function ccSpawn() {
+    cc = new Worker(scriptPath('c-compile-worker.js'));
+    cc.onmessage = function(e) {
+      var d = e.data || {};
+      if (d.progress) {
+        var pct = d.progress.total ? Math.floor(100 * d.progress.done / d.progress.total) : 0;
+        var msg = 'Loading the C compiler… ' + pct + '%'; // ~23 MB on the first run, then from cache
+        for (var k in ccPending) if (ccPending[k].onStatus) ccPending[k].onStatus(msg);
+        return;
+      }
+      var entry = ccPending[d.id];
+      if (!entry) return;
+      clearTimeout(entry.timer);
+      delete ccPending[d.id];
+      entry.cb(d);
+    };
+    cc.onerror = function(err) {
+      var msg = (err && err.message) || 'The C compiler worker failed to start';
+      ccKill();
+      ccRejectAll({ error: msg });
+    };
+  }
+
+  function ccKill() {
+    if (cc) { try { cc.terminate(); } catch (e) {} }
+    cc = null;
+    cWarmed = false;
+  }
+
+  function ccRejectAll(data) {
+    var snapshot = ccPending; ccPending = {};
+    for (var id in snapshot) {
+      if (snapshot.hasOwnProperty(id)) { clearTimeout(snapshot[id].timer); snapshot[id].cb(data); }
+    }
+  }
+
+  function ccRequest(payload, onStatus, cb) {
+    if (!cc) ccSpawn();
+    var id = ++ccId;
+    payload.id = id;
+    var timer = setTimeout(function() {
+      if (!ccPending[id]) return;
+      ccKill();             // a wedged download or compile: start over next time
+      ccRejectAll({ timeout: true });
+    }, C_COMPILE_TIMEOUT_MS);
+    ccPending[id] = { cb: cb, timer: timer, onStatus: onStatus };
+    cc.postMessage(payload);
+  }
+
+  // Start downloading Clang in the background once the user is working in C,
+  // so the first Run doesn't wait for it. Safe to call often.
+  function warmupC() {
+    if (cWarmed) return;
+    cWarmed = true;
+    ccRequest({ mode: 'warmup' }, null, function() {});
+  }
+
+  function loadCWasi(cb) {
+    if (DSA.cWasi) { cb(); return; }
+    loadScript(scriptPath('c-wasi.js'), function(err) { cb(err || (DSA.cWasi ? null : new Error('c-wasi.js missing'))); });
+  }
+
+  // Run a harness program's tests 0..n-1, each in a fresh instance, with a
+  // per-test time limit: on timeout, kill the run worker, give that test the
+  // time-limit error (plus whatever it printed) and resume after it.
+  function runCTests(wasm, n, cb) {
+    var W = DSA.cWasi;
+    var outs = [];
+    var next = 0;
+    function step() {
+      if (next >= n) { cb(outs.join('')); return; }
+      var w = new Worker(scriptPath('c-run-worker.js'));
+      var partial = '';
+      var timer = null;
+      function arm() { clearTimeout(timer); timer = setTimeout(onTimeout, C_TEST_TIMEOUT_MS); }
+      function stop() { clearTimeout(timer); w.onmessage = w.onerror = null; w.terminate(); }
+      function onTimeout() {
+        stop();
+        outs[next] = W.testOutput(next, { stdout: partial, crash: W.MSG.timeout });
+        next++; step();
+      }
+      w.onmessage = function(e) {
+        var d = e.data || {};
+        if (d.out) { if (d.out.fd === 1) partial += d.out.text; return; }
+        if (d.start !== undefined) { partial = ''; arm(); return; }
+        outs[d.i] = W.testOutput(d.i, d.res);
+        next = d.i + 1;
+        if (next >= n) { stop(); cb(outs.join('')); }
+      };
+      w.onerror = function(err) {
+        if (err && err.preventDefault) err.preventDefault();
+        stop();
+        outs[next] = W.testOutput(next, { stdout: partial, crash: W.crashMessage(err) });
+        next++; step();
+      };
+      arm(); // also covers instantiating the module before the first test starts
+      var copy = wasm.slice(0);
+      w.postMessage({ mode: 'tests', wasm: copy, from: next, n: n }, [copy]);
+    }
+    step();
+  }
+
+  // Run a plain program (main) once, with an overall time limit.
+  function runCPlain(wasm, stdin, timeoutMs, cb) {
+    var w = new Worker(scriptPath('c-run-worker.js'));
+    var out = '', err = '';
+    var timer = setTimeout(function() {
+      w.terminate();
+      cb({ stdout: out, stderr: err, exitCode: null, crash: null, timedOut: true });
+    }, timeoutMs);
+    w.onmessage = function(e) {
+      var d = e.data || {};
+      if (d.out) { if (d.out.fd === 1) out += d.out.text; else err += d.out.text; return; }
+      if (d.plain) { clearTimeout(timer); w.terminate(); cb(d.plain); }
+    };
+    w.onerror = function(e) {
+      if (e && e.preventDefault) e.preventDefault();
+      clearTimeout(timer); w.terminate();
+      cb({ stdout: out, stderr: err, exitCode: 1, crash: DSA.cWasi.crashMessage(e) });
+    };
+    var copy = wasm.slice(0);
+    w.postMessage({ mode: 'plain', wasm: copy, stdin: stdin || '' }, [copy]);
+  }
 
   /**
-   * Compile + run C source. cb receives:
-   *   { ok: true, stdout, stderr, exitCode, compileOutput }        — it ran
-   *   { compileError: '...' }                                      — didn't compile
-   *   { timeout: true } | { error: '...' }                         — network / service failure
+   * Compile + run C source in the browser. opts:
+   *   tests: n         source is a c-harness.js program with n tests; its
+   *                    stdout comes back in the format parseOutput() reads
+   *   stdin, timeoutMs (plain programs; default 10s)
+   *   onStatus(msg)    progress text while the compiler downloads
+   * cb receives:
+   *   { ok: true, stdout, stderr, exitCode, crash, timedOut, compileOutput } — it ran
+   *   { compileError: '...' }                                     — didn't compile
+   *   { timeout: true } | { error: '...' }                        — compiler didn't load
    */
   function runC(source, opts, cb) {
     opts = opts || {};
-    var timeoutMs = opts.timeoutMs || 30000;
-    var ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-    var done = false;
-    var timer = setTimeout(function() {
-      if (done) return; done = true;
-      if (ctrl) ctrl.abort();
-      cb({ timeout: true });
-    }, timeoutMs);
-    function finish(d) { if (done) return; done = true; clearTimeout(timer); cb(d); }
-
-    fetch(GODBOLT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify({
-        source: source,
-        lang: 'c',
-        options: {
-          userArguments: C_FLAGS,
-          executeParameters: { args: [], stdin: opts.stdin || '' },
-          compilerOptions: { executorRequest: true },
-          filters: { execute: true },
-          tools: [], libraries: []
-        },
-        allowStoreCodeDebug: false
-      }),
-      signal: ctrl ? ctrl.signal : undefined
-    }).then(function(r) {
-      if (!r.ok) throw new Error('Compiler service returned HTTP ' + r.status);
-      return r.json();
-    }).then(function(d) {
-      var build = d.buildResult || {};
-      var buildErr = stripAnsi(joinLines(build.stderr));
-      if (build.code !== undefined && build.code !== 0) {
-        finish({ compileError: buildErr || stripAnsi(joinLines(build.stdout)) || 'Compilation failed.' });
-        return;
-      }
-      if (!d.didExecute) {
-        finish({ compileError: buildErr || stripAnsi(joinLines(d.stderr)) || 'The program could not be run.' });
-        return;
-      }
-      finish({
-        ok: true,
-        stdout: joinLines(d.stdout),
-        stderr: stripAnsi(joinLines(d.stderr)),
-        exitCode: d.code,
-        timedOut: !!d.timedOut,
-        compileOutput: buildErr
+    loadCWasi(function(err) {
+      if (err) { cb({ error: String(err.message || err) }); return; }
+      if (typeof WebAssembly !== 'object') { cb({ error: 'This browser does not support WebAssembly.' }); return; }
+      cWarmed = true; // this request downloads the toolchain if a warmup didn't
+      ccRequest({ mode: 'compile', source: source }, opts.onStatus, function(d) {
+        if (d.timeout || d.error) { cb(d.timeout ? { timeout: true } : { error: d.error }); return; }
+        if (d.compileError !== undefined) { cb({ compileError: d.compileError }); return; }
+        if (opts.onStatus) opts.onStatus('Running…');
+        var compileOutput = d.diagnostics || '';
+        if (typeof opts.tests === 'number') {
+          runCTests(d.wasm, opts.tests, function(stdout) {
+            cb({ ok: true, stdout: stdout, stderr: '', exitCode: 0, crash: null, timedOut: false, compileOutput: compileOutput });
+          });
+        } else {
+          runCPlain(d.wasm, opts.stdin, opts.timeoutMs || C_RUN_TIMEOUT_MS, function(r) {
+            cb({ ok: true, stdout: r.stdout, stderr: r.stderr, exitCode: r.exitCode, crash: r.crash,
+                 timedOut: !!r.timedOut, compileOutput: compileOutput });
+          });
+        }
       });
-    }).catch(function(err) {
-      finish({ error: String((err && err.message) || err) });
     });
   }
 
@@ -391,10 +498,10 @@ var DSA = window.DSA || {};
     return 'Exited with code ' + code;
   }
 
-  // Tidy GCC diagnostics: drop ANSI, the temp-dir prefix and linker noise.
+  // Tidy compiler diagnostics (see DSA.cHarness.formatCompileErrors).
   function formatCError(raw) {
     if (DSA.cHarness) return DSA.cHarness.formatCompileErrors(raw);
-    return stripAnsi(raw).replace(/^.*?\/app\//gm, '').trim();
+    return String(raw || '').trim();
   }
 
   function loadCHarness(cb) {
@@ -408,6 +515,7 @@ var DSA = window.DSA || {};
     setEditorLang: setEditorLang,
     lang: lang,
     runC: runC,
+    warmupC: warmupC,
     describeExit: describeExit,
     formatCError: formatCError,
     loadCHarness: loadCHarness,

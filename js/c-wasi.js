@@ -29,6 +29,7 @@
   var GUARD_BYTES = 4096;
   var STACK_BYTES = 8 * 1024 * 1024 + GUARD_BYTES; // 8 MB usable, like a native default
   var MAX_MEMORY = 512 * 1024 * 1024;              // malloc returns NULL past this
+  var MAX_OUTPUT = 1024 * 1024;                    // stdout+stderr kept per run
 
   var CLANG_ARGS = [
     '--target=wasm32-wasip1', '-O2', '-std=gnu11', '-fno-color-diagnostics',
@@ -95,7 +96,11 @@
 
   /**
    * Instantiate `module` (a compiled WebAssembly.Module) and run its _start.
-   * opts: { args: string[], stdin: string }
+   * opts: { args: string[], stdin: string,
+   *         onOutput(fd, bytes)  called with each stdout/stderr write as it
+   *                              happens (the run worker streams it, so a
+   *                              program killed for running too long still
+   *                              shows what it printed) }
    * Returns { stdout, stderr, exitCode, crash } — crash is null, or a message
    * when the program trapped or wrote to the NULL guard zone.
    */
@@ -105,6 +110,8 @@
     var stdin = enc.encode(opts.stdin || '');
     var stdinPos = 0;
     var out = [], err = [];
+    var kept = 0, truncated = false;
+    var onOutput = opts.onOutput;
     var memory = null;
 
     function u8() { return new Uint8Array(memory.buffer); }
@@ -138,8 +145,13 @@
         for (var i = 0; i < iovsLen; i++) {
           var ptr = d.getUint32(iovs + 8 * i, true);
           var len = d.getUint32(iovs + 8 * i + 4, true);
-          if (len) (fd === 1 ? out : err).push(m.slice(ptr, ptr + len));
           total += len;
+          if (!len || truncated) continue;
+          var bytes = m.slice(ptr, ptr + Math.min(len, MAX_OUTPUT - kept));
+          kept += bytes.length;
+          if (kept >= MAX_OUTPUT) truncated = true;
+          (fd === 1 ? out : err).push(bytes);
+          if (onOutput) onOutput(fd, bytes);
         }
         d.setUint32(pWritten, total, true);
         return E.SUCCESS;
@@ -198,6 +210,7 @@
     }
     if (!crash && memory && guardDirty(memory)) { crash = MSG.nullWrite; exitCode = 1; }
 
+    if (truncated) err.push(enc.encode('\n[output truncated after ' + (MAX_OUTPUT >> 20) + ' MB]\n'));
     return {
       stdout: dec.decode(concat(out)),
       stderr: dec.decode(concat(err)),

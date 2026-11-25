@@ -53,7 +53,8 @@ if (!isMainThread) {
       const files = await clang(args, { 'prog.c': source }, {
         stdout: b => { if (b) diag += dec.decode(b, { stream: true }); },
         stderr: b => { if (b) diag += dec.decode(b, { stream: true }); },
-        fetchProgress: () => {}
+        fetchProgress: () => {},
+        decodeASCII: false
       });
       return { bytes: files[out], diag };
     } catch (e) {

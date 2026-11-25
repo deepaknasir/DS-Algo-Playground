@@ -6,11 +6,10 @@ var DSA = window.DSA || {};
   // CodeMirror lives in js/cdn-loader.js (DSA.cdnLoader.*); Python runs
   // off-thread via DSA.cdnLoader.runPython (see js/pyodide-worker.js). C runs
   // through js/c-harness.js (wraps the solution in a test main()) and
-  // DSA.cdnLoader.runC (GCC on godbolt.org).
+  // DSA.cdnLoader.runC (Clang compiled to WebAssembly, in the browser).
   function loadCodeMirror(cb) { DSA.cdnLoader.loadCodeMirror(cb); }
 
   var RUN_TIMEOUT_MS = 6000; // kill runaway/infinite-loop solutions after this long
-  var C_TIMEOUT_MS = 30000;  // C: network + compile + run (each test has its own 2s limit)
 
   // --- Failure banner: prepend a dismissible warning above the practice block
   //     so users on locked-down networks see an actionable hint. ---
@@ -276,6 +275,7 @@ var DSA = window.DSA || {};
       cmEditor = DSA.cdnLoader.makeEditor(editorWrap, initialCodeFor(lang), lang);
       statusSpan.textContent = 'Ready';
       if (lang === 'python') DSA.cdnLoader.warmup(); // pre-load Pyodide in the worker
+      else DSA.cdnLoader.warmupC();                  // fetch the C compiler in the background
 
       // Debounced autosave on edit (per language).
       var saveTimer = null;
@@ -323,7 +323,7 @@ var DSA = window.DSA || {};
       results.style.display = 'none';
       statusSpan.className = 'practice-block__status';
       statusSpan.textContent = 'Ready';
-      if (l === 'python') DSA.cdnLoader.warmup();
+      if (l === 'python') DSA.cdnLoader.warmup(); else DSA.cdnLoader.warmupC();
     }
     if (cSpec) DSA.cdnLoader.lang.onChange(switchLang);
 
@@ -429,7 +429,7 @@ var DSA = window.DSA || {};
     });
   }
 
-  // --- C test run: harness → GCC (godbolt.org) → per-test results ---
+  // --- C test run: harness → Clang/wasm32-wasi in the browser → per-test results ---
   function runCTestsFor(el, cSpec, results, statusSpan, code, allTests, finish, resetBtn, fail) {
     DSA.cdnLoader.loadCHarness(function(err) {
       if (err) {
@@ -450,14 +450,16 @@ var DSA = window.DSA || {};
         });
         return;
       }
-      DSA.cdnLoader.runC(program.source, { timeoutMs: C_TIMEOUT_MS }, function(d) {
+      var onStatus = function(msg) { statusSpan.textContent = msg; };
+      DSA.cdnLoader.runC(program.source, { tests: allTests.length, onStatus: onStatus }, function(d) {
         finish(function() {
           resetBtn();
           if (d.timeout || d.error) {
-            fail(d.timeout ? 'Timed out' : 'Compiler unavailable');
-            showBanner(el, 'godbolt',
-              'C code is compiled and run by Compiler Explorer (godbolt.org), and it could not be reached' +
-              (d.error ? ' (' + d.error + ')' : '') + '. Check your network. Your code is preserved, so click Run again once you reconnect.');
+            fail('Compiler unavailable');
+            showBanner(el, 'c-compiler',
+              'The C compiler runs in your browser, but it has to be downloaded once (about 23 MB from cdn.jsdelivr.net), and that ' +
+              (d.timeout ? 'took too long' : 'failed (' + d.error + ')') +
+              '. Check your network. Your code is preserved, so click Run again once you reconnect.');
             results.innerHTML = '';
             results.style.display = 'none';
             return;

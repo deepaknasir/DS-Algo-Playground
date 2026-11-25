@@ -5,11 +5,11 @@ var DSA = window.DSA || {};
 
   // CodeMirror lives in js/cdn-loader.js (DSA.cdnLoader.*). Python runs
   // off-thread via DSA.cdnLoader.runPython (see js/pyodide-worker.js); C is
-  // compiled and run with GCC via DSA.cdnLoader.runC (godbolt.org).
+  // compiled and run in the browser via DSA.cdnLoader.runC (Clang → WebAssembly).
   function loadCodeMirror(cb) { DSA.cdnLoader.loadCodeMirror(cb); }
 
   var RUN_TIMEOUT_MS = 6000;    // stop runaway/infinite-loop Python after this long
-  var C_TIMEOUT_MS = 30000;     // C: network round-trip + compile + run
+  var C_TIMEOUT_MS = 10000;     // stop a runaway C program after this long
 
   // --- Source for one language from a code block (null if absent) ---
   function getSource(block, lang) {
@@ -91,7 +91,7 @@ var DSA = window.DSA || {};
       else header.insertBefore(langSwitch, header.firstChild);
     }
 
-    function labelFor(l) { return l === 'c' ? 'C · GCC 13' : 'Python'; }
+    function labelFor(l) { return l === 'c' ? 'C · Clang' : 'Python'; }
     titleEl.textContent = labelFor(current);
 
     function resetOutput() {
@@ -110,7 +110,7 @@ var DSA = window.DSA || {};
         cmEditor.setValue(edited[l] !== undefined ? edited[l] : initialFor(l));
       }
       resetOutput();
-      if (l === 'python') DSA.cdnLoader.warmup();
+      if (l === 'python') DSA.cdnLoader.warmup(); else DSA.cdnLoader.warmupC();
     }
     DSA.cdnLoader.lang.onChange(switchTo);
 
@@ -127,6 +127,7 @@ var DSA = window.DSA || {};
       cmEditor = DSA.cdnLoader.makeEditor(editorWrap, initialFor(current), current);
       statusEl.textContent = 'Ready';
       if (current === 'python') DSA.cdnLoader.warmup(); // pre-load Pyodide in the worker
+      else if (current === 'c') DSA.cdnLoader.warmupC(); // fetch the C compiler in the background
     });
 
     // Copy button (wired in code-block.js) copies what's in the editor now
@@ -185,16 +186,13 @@ var DSA = window.DSA || {};
       runBtn.disabled = true;
 
       DSA.cdnLoader.loadCHarness(function() { // only for its error formatter
-        DSA.cdnLoader.runC(code, { timeoutMs: C_TIMEOUT_MS }, function(d) {
+        var onStatus = function(msg) { statusEl.textContent = msg; };
+        DSA.cdnLoader.runC(code, { timeoutMs: C_TIMEOUT_MS, onStatus: onStatus }, function(d) {
           runBtn.disabled = false;
-          if (d.timeout) {
-            showError('Timed out', '⏱ No answer from the compiler service after ' +
-              (C_TIMEOUT_MS / 1000) + 's. Check your network and try again.');
-            return;
-          }
-          if (d.error) {
-            showError('Error', 'Could not reach the C compiler (godbolt.org): ' + d.error +
-              '\nC code is compiled by Compiler Explorer’s public API, so it needs a network connection.');
+          if (d.timeout || d.error) {
+            showError('Error', 'Could not load the C compiler' + (d.error ? ': ' + d.error : ' (took too long)') +
+              '.\nC runs in your browser, but the compiler is downloaded once (about 23 MB from cdn.jsdelivr.net), ' +
+              'so the first run needs a network connection.');
             return;
           }
           if (d.compileError) {
@@ -203,8 +201,8 @@ var DSA = window.DSA || {};
           }
           var out = d.stdout || '';
           if (d.stderr) out += (out ? '\n' : '') + d.stderr;
-          var exitMsg = d.timedOut ? 'Time limit exceeded — your code may have an infinite loop.' :
-                        DSA.cdnLoader.describeExit(d.exitCode);
+          var exitMsg = d.timedOut ? 'Time limit exceeded (' + (C_TIMEOUT_MS / 1000) + 's) — your code may have an infinite loop.' :
+                        d.crash || DSA.cdnLoader.describeExit(d.exitCode);
           if (exitMsg) {
             showError('Error', (out ? out + '\n\n' : '') + exitMsg);
             return;
