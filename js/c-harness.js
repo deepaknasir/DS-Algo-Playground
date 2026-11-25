@@ -272,9 +272,11 @@
     '#include <limits.h>',
     '#include <math.h>',
     '#include <ctype.h>',
+    '#ifndef __wasi__', // wasm has no signals: see MAIN_RT
     '#include <setjmp.h>',
     '#include <signal.h>',
     '#include <unistd.h>',
+    '#endif',
     '#define DSA_NULL INT_MIN'
   ].join('\n');
 
@@ -445,9 +447,28 @@ static void dsa_out_list(struct ListNode* h) {
 }
 `;
 
-  // Test loop: each test runs under sigsetjmp so a crash or a per-test
+  // Test loop. Native: each test runs under sigsetjmp so a crash or a per-test
   // timeout reports an error for that test and the rest keep running.
+  // wasm32-wasi (the in-browser compiler) has no signals, setjmp or alarm():
+  // there the program runs the single test whose index is argv[1], and the
+  // host (js/c-wasi.js) runs each test in a fresh instance, turns a trap into
+  // that test's ERR line and enforces the time limit by killing the worker.
   var MAIN_RT = String.raw`
+static void dsa_report_ok(int i) {
+  fflush(stdout);
+  printf("\n${MARK}|%d|OK|%s\n", i, dsa_ob ? dsa_ob : "");
+  fflush(stdout);
+}
+#ifdef __wasi__
+int main(int argc, char** argv) {
+  int i = argc > 1 ? atoi(argv[1]) : -1;
+  if (i < 0 || i >= DSA_NTESTS) { fprintf(stderr, "usage: prog <test index 0..%d>\n", DSA_NTESTS - 1); return 2; }
+  setvbuf(stdout, NULL, _IOLBF, 1 << 16); // a trap loses only an unfinished line
+  dsa_tests[i]();
+  dsa_report_ok(i);
+  return 0;
+}
+#else
 static sigjmp_buf dsa_jmp; static volatile sig_atomic_t dsa_sig;
 static void dsa_on_signal(int s) { dsa_sig = s; siglongjmp(dsa_jmp, 1); }
 static const char* dsa_sig_name(int s) {
@@ -461,11 +482,6 @@ static const char* dsa_sig_name(int s) {
     case SIGTRAP: return "Trap (undefined behavior the compiler trapped)";
     default:      return "Program crashed";
   }
-}
-static void dsa_report_ok(int i) {
-  fflush(stdout);
-  printf("\n${MARK}|%d|OK|%s\n", i, dsa_ob ? dsa_ob : "");
-  fflush(stdout);
 }
 static void dsa_report_err(int i, const char* msg) {
   fflush(stdout);
@@ -497,6 +513,7 @@ int main(void) {
   }
   return 0;
 }
+#endif
 `;
 
   function countLines(s) { return s.split('\n').length; }

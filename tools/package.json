@@ -1,0 +1,8 @@
+{
+  "name": "dsa-playground-tools",
+  "private": true,
+  "description": "Maintainer tools only (the site itself has no build step). @yowasp/clang is the same in-browser C toolchain the site loads from jsDelivr; build_c.py --toolchain wasm uses it to verify C solutions the way the browser runs them.",
+  "devDependencies": {
+    "@yowasp/clang": "22.0.0-git20695-13"
+  }
+}

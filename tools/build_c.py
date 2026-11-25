@@ -27,7 +27,7 @@ Each file is split into sections by lines starting with "//@":
              //@practice <fn>     followed by //@spec, //@starter, //@solution
                                   for the topic practice block with data-fn=<fn>
 
-Verification (needs gcc + node):
+Verification (needs node, plus gcc and/or the wasm toolchain):
   * every approach / practice solution passes all of its test cases through the
     same harness the browser uses (js/c-harness.js)
   * every starter compiles
@@ -35,31 +35,45 @@ Verification (needs gcc + node):
     version prints
   * every trace listing compiles
 
+Toolchains (--toolchain, default gcc):
+  gcc    native gcc -std=gnu11 -O2
+  wasm   the in-browser toolchain the site runs: Clang compiled to WebAssembly
+         targeting wasm32-wasi, run through js/c-wasi.js (tools/c_wasm.mjs).
+         One-time setup: npm --prefix tools install
+  both   gcc, then wasm (files are written once, after the last pass)
+
 Usage:  python3 tools/build_c.py            # verify + write
         python3 tools/build_c.py --check    # verify only
         python3 tools/build_c.py --only two-sum,arrays
+        python3 tools/build_c.py --check --toolchain wasm
 """
 import argparse
 import concurrent.futures as cf
 import html
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CSRC = os.path.join(ROOT, 'c-src')
 CLI = os.path.join(ROOT, 'tools', 'c_harness_cli.js')
+WASM_CLI = os.path.join(ROOT, 'tools', 'c_wasm.mjs')
 PROBLEMS_JSON = os.path.join(ROOT, 'data', 'problems.json')
 GCC = ['gcc', '-std=gnu11', '-O2']
 WARN = ['-Wall', '-Wextra', '-Wno-unused-parameter', '-Wno-unused-function', '-Wno-sign-compare']
 
 failures = []
+PASS_LABEL = ''  # toolchain name prefixed to failures when running --toolchain both
 
 
 def fail(where, msg):
+    if PASS_LABEL:
+        where = f'[{PASS_LABEL}] {where}'
     failures.append((where, msg))
     print(f'  FAIL {where}: {msg.strip()[:2000]}', file=sys.stderr)
 
@@ -150,7 +164,58 @@ def auto_starter(spec, sig, hints):
 
 
 # ------------------------------------------------------------ compile/run
-def compile_run(source, name, workdir, run=True, warn=False, timeout=60):
+TOOLCHAIN = 'gcc'  # set per pass by main()
+
+
+class WasmPool:
+    """A few long-lived `node tools/c_wasm.mjs` processes (each keeps Clang
+    loaded), shared by the verifier's worker threads."""
+
+    def __init__(self, size):
+        self.procs = queue.Queue()
+        self.all = []
+        for _ in range(size):
+            p = subprocess.Popen(['node', WASM_CLI], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, text=True, bufsize=1)
+            self.all.append(p)
+            self.procs.put(p)
+        self.ids = 0
+        self.lock = threading.Lock()
+
+    def request(self, req):
+        with self.lock:
+            self.ids += 1
+            req = dict(req, id=self.ids)
+        p = self.procs.get()
+        try:
+            p.stdin.write(json.dumps(req) + '\n')
+            p.stdin.flush()
+            line = p.stdout.readline()
+        finally:
+            self.procs.put(p)
+        if not line:
+            raise RuntimeError('tools/c_wasm.mjs exited; run it by hand for details '
+                               '(missing toolchain? npm --prefix tools install)')
+        return json.loads(line)
+
+    def close(self):
+        for p in self.all:
+            p.stdin.close()
+        for p in self.all:
+            p.wait()
+
+
+wasm_pool = None
+
+
+def compile_run(source, name, workdir, run=True, warn=False, timeout=60, tests=None):
+    """tests=n: source is a harness program with n tests (the wasm build runs
+    one instance per test; the native build loops over them itself)."""
+    if TOOLCHAIN == 'wasm':
+        r = wasm_pool.request({'source': source, 'run': run, 'flags': WARN if warn else ['-w'],
+                               'tests': tests, 'timeoutMs': 10000 if tests else timeout * 1000})
+        r.pop('id', None)
+        return r
     cpath = os.path.join(workdir, name + '.c')
     exe = os.path.join(workdir, name)
     with open(cpath, 'w') as f:
@@ -185,7 +250,7 @@ def verify_solutions(jobs, workdir):
         if 'error' in b:
             return i, {'harness_error': b['error']}
         safe = re.sub(r'[^A-Za-z0-9_]', '_', where)
-        return i, compile_run(b['source'], safe, workdir, run=run, warn=True)
+        return i, compile_run(b['source'], safe, workdir, run=run, warn=True, tests=len(tests))
 
     with cf.ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as ex:
         for i, r in ex.map(work, range(len(jobs))):
@@ -437,20 +502,35 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--check', action='store_true', help='verify only, do not write')
     ap.add_argument('--only', default='', help='comma-separated problem ids / topic names')
+    ap.add_argument('--toolchain', choices=['gcc', 'wasm', 'both'], default='gcc',
+                    help='compiler to verify with (wasm = the in-browser toolchain)')
     args = ap.parse_args()
     only = set(x for x in args.only.split(',') if x)
-    write = not args.check
-    with tempfile.TemporaryDirectory() as wd:
-        tdir = os.path.join(CSRC, 'topics')
-        topic_jobs = []
-        for f in sorted(os.listdir(tdir)) if os.path.isdir(tdir) else []:
-            if f.endswith('.c') and (not only or f[:-2] in only):
-                topic_jobs += build_topic(f[:-2], write, wd)
-        if topic_jobs:
-            print(f'topics: verifying {len(topic_jobs)} practice programs')
-            verify_solutions(topic_jobs, wd)
-        if os.path.isdir(os.path.join(CSRC, 'problems')):
-            build_problems(only, write, wd)
+    passes = ['gcc', 'wasm'] if args.toolchain == 'both' else [args.toolchain]
+    global TOOLCHAIN, PASS_LABEL, wasm_pool
+    for n, tc in enumerate(passes):
+        TOOLCHAIN = tc
+        PASS_LABEL = tc if len(passes) > 1 else ''
+        write = not args.check and n == len(passes) - 1
+        print(f'== toolchain: {tc}')
+        if tc == 'wasm':
+            wasm_pool = WasmPool(min(4, os.cpu_count() or 1))
+        try:
+            with tempfile.TemporaryDirectory() as wd:
+                tdir = os.path.join(CSRC, 'topics')
+                topic_jobs = []
+                for f in sorted(os.listdir(tdir)) if os.path.isdir(tdir) else []:
+                    if f.endswith('.c') and (not only or f[:-2] in only):
+                        topic_jobs += build_topic(f[:-2], write, wd)
+                if topic_jobs:
+                    print(f'topics: verifying {len(topic_jobs)} practice programs')
+                    verify_solutions(topic_jobs, wd)
+                if os.path.isdir(os.path.join(CSRC, 'problems')):
+                    build_problems(only, write, wd)
+        finally:
+            if wasm_pool:
+                wasm_pool.close()
+                wasm_pool = None
     if failures:
         print(f'\n{len(failures)} failure(s)', file=sys.stderr)
         sys.exit(1)
